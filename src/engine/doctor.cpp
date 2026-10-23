@@ -7,6 +7,7 @@
 #include "hub/hub.h"
 #include "metal/gpu.h"
 #include "model/dory.h"
+#include "model/expert_store.h"
 #include "model/nemotron_h.h"
 #include "model/nh_drafter.h"
 #include "model/qwen35.h"
@@ -48,6 +49,22 @@ uint64_t ram_bytes() {
   size_t n = sizeof m;
   sysctlbyname("hw.memsize", &m, &n, nullptr, 0);
   return m;
+}
+
+// The automatic expert store `kapitsa serve` will pick for a Q2_0 Flash-Next pack (Qwen4Exp::init_store with
+// NI_EXPERT_STORE unset), before any load: the model's budget (flash_next_model_budget) less its GPU memory before the
+// store (the plan's weights without the smallest store, MTP head and prefill buffers) and init_store's 0.5 GB, then
+// q20::auto_store_size with this Mac's available memory now and its chip's RAM-share cap.
+q20::AutoStoreIn planned_store(const MemPlan& m, int slots, int ctx, size_t budget, bool apple10) {
+  q20::AutoStoreIn in;
+  const size_t mb = flash_next_model_budget(m, slots, ctx, budget);
+  in.all = m.store_all, in.least = m.store_least;
+  in.used = m.weights - std::min(m.weights, m.store_least) + m.mtp + m.activations;
+  in.keep = size_t(1) << 29;
+  in.left = mb > in.used + in.keep ? mb - in.used - in.keep : 0;
+  in.ram = size_t(ram_bytes()), in.avail = q20::available_memory();
+  in.cap = q20::auto_store_cap(apple10);
+  return in;
 }
 
 }  // namespace
@@ -246,6 +263,7 @@ int run_doctor(int argc, char** argv) {
   std::vector<std::string> models, roots;
   int ctx = 65536, slots_opt = 0, chunk = 0;  // slots 0: per model as the engine picks them (auto_slots); chunk 0: as
                                                // the engine picks it (auto_prefill_chunk)
+  bool ctx_given = false;  // --context given: the expert store line plans at it, else at serve's (start_plan)
   std::string dflash;                      // as the server's --dflash ("": NI_DFLASH or auto)
   bool as_json = false;
   double budget_gb = 0;
@@ -259,6 +277,7 @@ int run_doctor(int argc, char** argv) {
     else if (a == "--context" || a == "--ctx") {
       std::string why;
       ctx = parse_context(next(), &why);
+      ctx_given = true;
       if (ctx == kContextMax) why = "--context max has no one size here (every model is planned at one context): give it in tokens (--context 256k)";
       if (ctx <= 0) {
         if (term::fancy()) term::error(why, "kapitsa doctor --help shows how to use it.");
@@ -433,6 +452,41 @@ int run_doctor(int argc, char** argv) {
     const size_t start_need = fixed + m.kv_per_pos * size_t(std::min(ctx, 8192));
     const size_t full_need = fixed + m.kv_per_pos * size_t(ctx) * size_t(slots);
     const size_t room = budget > fixed ? budget - fixed : 0;
+    // a Q2_0 pack's routed experts: the store kapitsa serve picks and why (NI_EXPERT_STORE=<GB> or all sets it instead)
+    std::string store_line, store_short;  // the whole reason (plain text, --json); a short one (the styled view)
+    nlohmann::ordered_json store_j;
+    if (m.streamed) {
+      const char* es = getenv("NI_EXPERT_STORE");
+      if (es && *es && strcmp(es, "auto")) {
+        const size_t b = std::min(m.store_all, !strcmp(es, "all") ? m.store_all : size_t(atof(es) * 1e9));
+        char t[160];
+        snprintf(t, sizeof t, "%.1f GB of the %.1f GB of experts (NI_EXPERT_STORE=%s)", b / 1e9, m.store_all / 1e9, es);
+        store_line = store_short = t;
+        store_j = {{"bytes", b}, {"all_bytes", m.store_all}, {"reason", "NI_EXPERT_STORE"}, {"text", store_line}};
+      } else {
+        // planned as `kapitsa serve` starts this model (start_plan, as Engine's constructor): without --context at
+        // serve's default context here (default_context) and the slots and prefill chunk that go with it, not at
+        // doctor's 64K; with --context at it, within the model's limit as serve takes it
+        EngineOptions so;
+        so.context = ctx_given ? context_within_limit(dir, ctx) : 0;
+        so.slots = slots_opt, so.prefill_chunk = chunk, so.dflash = dflash;
+        const StartPlan sp = start_plan(dir, so, budget);
+        const MemPlan sm = sp.prefill_chunk == lp.prefill_chunk ? m : model_plan(dir, sp.prefill_chunk);
+        const q20::AutoStoreIn in = planned_store(sm, sp.slots, sp.context, budget, g.apple10());
+        const q20::AutoStore st = q20::auto_store_size(in);
+        store_line = q20::auto_store_reason(st, in);
+        store_short = q20::auto_store_short(st, in);
+        store_j = {{"bytes", st.bytes},
+                   {"all_bytes", m.store_all},
+                   {"reason", q20::auto_store_why_name(st.why)},
+                   {"context", sp.context},
+                   {"slots", sp.slots},
+                   {"budget_leaves_bytes", in.left},
+                   {"available_memory_bytes", in.avail},
+                   {"ram_share_cap", in.cap},
+                   {"text", store_line}};
+      }
+    }
     const size_t tokens = room / std::max<size_t>(m.kv_per_pos, 1);
     const double dec = bw > 0 && m.decode_bytes ? 0.75 * bw * 1e9 / double(m.decode_bytes) : 0;
     // prefill: ~0.33 TFLOP/s of fp16 MMA per GPU core (M4 Pro: 6-7 TFLOP/s on 20), 2 flops per weight
@@ -467,6 +521,7 @@ int run_doctor(int argc, char** argv) {
     const auto enc = vision::open_encoder(dir);  // images: the encoder's weights load with the first image
     o["image_encoder_bytes"] = enc ? enc->weight_bytes() : 0;
     if (dory) o["dory"] = dory_j;
+    if (m.streamed) o["expert_store"] = store_j;
     o["decode_tps_estimate"] = std::round(dec);
     o["prefill_tps_estimate_gpu"] = std::round(pf);
     arr.push_back(o);
@@ -484,7 +539,7 @@ int run_doctor(int argc, char** argv) {
                    : m.mtp ? "MTP head" : lookup > 0 ? "prompt lookup" : "plain";
       r.image_bytes = enc ? enc->weight_bytes() : 0;
       r.dec = dec, r.pf = pf;
-      r.note = dory_note;
+      r.note = m.streamed ? "expert store: " + store_short : dory_note;
       r.default_ctx = default_ctx, r.ctx_limit = model_context_limit(dir);
       tty_rows.push_back(r);
       continue;
@@ -500,9 +555,8 @@ int run_doctor(int argc, char** argv) {
            ane_bytes ? (", Neural Engine split " + std::to_string(int(ane_bytes / 1e6)) + " MB").c_str() : "",
            lp.dflash_bytes ? (std::string(", ") + drafter + " " + std::to_string(int(lp.dflash_bytes / 1e6)) + " MB").c_str() : "");
     if (m.streamed)
-      printf("    routed experts: %.1f GB streamed from the SSD through a store of what the budget leaves, "
-             "within 40%% of the RAM before the M5 and the system's available memory (the weights count its smallest size)\n",
-             m.streamed / 1e9);
+      printf("    routed experts: %.1f GB streamed from the SSD (the weights count the smallest store); expert store: %s\n",
+             m.streamed / 1e9, store_line.c_str());
     if (start_need > budget)
       printf("    fits: NO: needs %.1f GB with an 8k-token conversation, the budget is %.1f GB\n", start_need / 1e9,
              budget / 1e9);

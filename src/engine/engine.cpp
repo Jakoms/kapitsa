@@ -240,8 +240,11 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   // Memory: fail before reading any weights when the model, its buffers and the slots' state with a minimal
   // KV cache cannot fit the budget; the KV caches then grow as conversations fill (Qwen35::reserve).
   budget_ = opts_.mem_budget_gb > 0 ? size_t(opts_.mem_budget_gb * 1e9) : default_mem_budget();
+  // the context, slots, drafter and prefill chunk (start_plan: `kapitsa doctor` plans the same)
+  const StartPlan sp = start_plan(opts_.model_dir, opts_, budget_);
+  opts_.context = sp.context;
   if (opts_.slots <= 0) {
-    opts_.slots = auto_slots(opts_.model_dir, opts_, budget_);
+    opts_.slots = sp.slots;
     logi("slots: %d (%s; --slots sets how many requests run at once)", opts_.slots,
          opts_.slots == kAutoSlots ? "the default where memory allows"
                                    : "as many as this budget holds with one full conversation, the same drafter and prefill chunk");
@@ -250,15 +253,14 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
   // (DFlash2::find: next to it or in ~/.cache/nace-infer-models/drafters) replaces MTP; without one MTP stays.
   // --dflash none / NI_DFLASH=0 keeps MTP, --dflash <dir> names the drafter, --spec 0 turns both off. Found before
   // the model loads, so its memory counts in the fit check; auto leaves it out where it would cost context.
-  const LoadPlan lp = plan_load(opts_.model_dir, opts_.dflash, opts_.spec_depth == 0, opts_.context, opts_.slots,
-                                budget_, opts_.prefill_chunk);
+  const LoadPlan& lp = sp.load;
   if (!lp.dflash_left_out.empty())
     logi("DFlash2: %s left out: its %.2f GB would keep a %d-token conversation from fitting the %.1f GB budget",
          lp.dflash_left_out.c_str(), lp.dflash_found_bytes / 1e9, opts_.context, budget_ / 1e9);
   {
     const int slots = std::max(1, opts_.slots);
     if (opts_.prefill_chunk <= 0) {
-      opts_.prefill_chunk = lp.prefill_chunk;
+      opts_.prefill_chunk = sp.prefill_chunk;
       const int base = opts_.prefill_chunk > 2048 && opts_.prefill_chunk <= prefill_chunk_room(2048)
                            ? 2048  // only its tail room: the 2048-row chunk still fits
                            : opts_.prefill_chunk;
@@ -295,9 +297,8 @@ Engine::Engine(const EngineOptions& o) : opts_(o) {
     // Qwen3.8-Flash-Next; a Q2_0 pack's expert store takes what the budget leaves after the slots' state and one
     // conversation's KV cache (up to 32K tokens)
     const MemPlan mp = model_plan(opts_.model_dir, opts_.prefill_chunk);
-    const int slots = std::max(1, opts_.slots);
-    const size_t keep = size_t(slots) * mp.slot_state + mp.kv_per_pos * size_t(std::min(opts_.context, 32768));
-    auto m = std::make_unique<Qwen4Exp>(opts_.model_dir, opts_.prefill_chunk, budget_ > keep ? budget_ - keep : 1);
+    auto m = std::make_unique<Qwen4Exp>(opts_.model_dir, opts_.prefill_chunk,
+                                        flash_next_model_budget(mp, opts_.slots, opts_.context, budget_));
     q35_ = m.get();
     model_ = std::move(m);
   } else if (Dory::is_model(opts_.model_dir)) {
@@ -584,6 +585,11 @@ size_t default_mem_budget() {
   return rws - std::max<size_t>(size_t(512) << 20, rws / 25);
 }
 
+size_t flash_next_model_budget(const MemPlan& mp, int slots, int context, size_t budget) {
+  const size_t keep = size_t(std::max(1, slots)) * mp.slot_state + mp.kv_per_pos * size_t(std::min(context, 32768));
+  return budget > keep ? budget - keep : 1;
+}
+
 MemPlan model_plan(const std::string& model_dir, int prefill_chunk) {
   // kept per process: a model's headers do not change while it is planned, and the largest take most of a second to
   // read (Super-VL's), which the picker, `kapitsa doctor` and default_context would otherwise pay on every plan.
@@ -761,6 +767,17 @@ StartNeed start_need(const std::string& model_dir, const LoadPlan& lp, int prefi
            mp.activations / 1e9, slots * mp.slot_state / 1e9, min_ctx, mp.kv_per_pos * min_ctx / 1e9);
   n.parts = b;
   return n;
+}
+
+StartPlan start_plan(const std::string& model_dir, const EngineOptions& opt, size_t budget) {
+  StartPlan sp;
+  sp.context = opt.context > 0 ? opt.context : default_context(model_dir, opt, budget);
+  EngineOptions at = opt;
+  at.context = sp.context;
+  sp.slots = opt.slots > 0 ? opt.slots : auto_slots(model_dir, at, budget);
+  sp.load = plan_load(model_dir, opt.dflash, opt.spec_depth == 0, sp.context, sp.slots, budget, opt.prefill_chunk);
+  sp.prefill_chunk = opt.prefill_chunk > 0 ? opt.prefill_chunk : sp.load.prefill_chunk;
+  return sp;
 }
 
 int auto_slots(const std::string& model_dir, const EngineOptions& opt, size_t budget) {

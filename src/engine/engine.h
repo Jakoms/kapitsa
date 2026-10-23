@@ -86,6 +86,10 @@ inline int fit_slots(int slots) { return slots > 0 ? slots : 2; }
 // (recommendedMaxWorkingSetSize, which macOS sizes from the RAM) minus a margin (4%, at least 512 MB) for
 // the Neural Engine service's buffers and other GPU users. NI_MEM_BUDGET=<GB> overrides it.
 size_t default_mem_budget();
+// Qwen3.8-Flash-Next: the memory budget the engine gives the model (Qwen4Exp's mem_budget), the slots' state and one
+// conversation's KV cache (up to 32K tokens) set apart; a Q2_0 pack's expert store takes what that leaves after the
+// weights (the engine and `kapitsa doctor` share it). At least 1 byte.
+size_t flash_next_model_budget(const MemPlan& mp, int slots, int context, size_t budget);
 // The prefill chunk (rows) the engine picks when none is given: 2048, or 1024 when 2048-row buffers would leave
 // less than one conversation of `context` tokens in the budget (activations scale with the chunk), less (a multiple of
 // 64, at least 256) when 1024-row ones would leave less than the tokens the engine starts with (the context, up to 8K)
@@ -117,6 +121,16 @@ struct LoadPlan {
 // before speed); prefill_chunk 0 = auto_prefill_chunk with the drafter's memory set aside.
 LoadPlan plan_load(const std::string& model_dir, const std::string& dflash, bool spec_off, int context, int slots,
                    size_t budget, int prefill_chunk);
+// What an engine starts a model with, as `kapitsa serve` resolves it before loading: the context (opt.context <= 0:
+// default_context, serve's without --context; else as given, which serve has capped at the model's limit with
+// context_within_limit), the slots (opt.slots 0: auto_slots at
+// that context), the load plan and the prefill chunk (opt.prefill_chunk 0: the load plan's). Engine's constructor and
+// `kapitsa doctor` (its expert store line) share it, so doctor plans what serve starts.
+struct StartPlan {
+  int context = 0, slots = 0, prefill_chunk = 0;
+  LoadPlan load;
+};
+StartPlan start_plan(const std::string& model_dir, const EngineOptions& opt, size_t budget);
 // What the engine needs to start a model (it refuses to load it past the budget): the weights, the MTP head, the
 // drafter plan_load keeps, prefill buffers for `prefill_chunk` rows, the slots' state and an 8k-token conversation
 // (min(context, 8192)). From config.json and the safetensors headers alone, so `kapitsa serve` can check a model
