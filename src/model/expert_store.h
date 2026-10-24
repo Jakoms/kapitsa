@@ -185,6 +185,7 @@ class ExpertCache {
     int readers = 16;     // reader threads (NI_EXPERT_READERS)
     bool direct = false;  // NI_EXPERT_IO=direct: unaligned pieces read straight into their slot too
     bool fill = true;     // fill the arena at start (NI_EXPERT_FILL=0: no)
+    bool scan_victim = true;  // a sweep evicts the layers it has passed (NI_SCAN_VICTIM=0: ARC's rule, as before)
   };
   // One layer's handshake: the routing ids (n uint32 expert ids of `layer`, repeats allowed) are readable once the
   // event reaches `ready`; the turn sets it to `go` when every routed expert is in its slot. pred / npred: ids predicted
@@ -216,6 +217,10 @@ class ExpertCache {
   void post(const Req& r);                      // in the order the GPU will reach them
   uint32_t word(int slot) const;                // a slot's table word
   int slot_of(int layer, uint32_t e) const;     // tests: the expert's slot, -1 if absent (only while nothing is served)
+  int lowest_layer() const { return low_layer_; }  // tests: the lowest layer any slot holds (scan_victim's floor)
+  int lowest_t1_layer() const { return low_t1_; }  // tests: the lowest layer holding a T1 key, the sweep's victims
+  int t1_slots(int layer) const;                   // tests: the per-layer T1 count admit/evict/hit keep
+  int t1_slots_in_table(int layer) const;          // tests: the same, recomputed from the slots and their lists
   StoreStats stats() const;
   void reset_stats();
   double fill_ms() const { return fill_ms_; }
@@ -243,18 +248,21 @@ class ExpertCache {
   void lst_push(List& L, int k);
   List& list_of(Where w);
   int lru_free(const List& L) const;  // least recent key neither pinned nor being read, -1 if none
+  int scan_victim(int k);             // a sweep's victim: a slot below k's layer, rotating over the slots, -1 if none
   void hit(int k, bool scan, bool first);  // first: k was read ahead and is routed for the first time
   int admit(int k, bool scan);        // a slot for absent key k (evicting if needed); k into T1 / T2
   void evict(int k);
   void trim_ghosts();
   void load(int k, bool urgent);      // reads of k's planes into its slot
   uint8_t* slot_ptr(int slot) const;
+  void t1_add(int layer);   // k into T1 (admit): the layer's T1 count up, the floor possibly down
+  void t1_drop(int layer);  // out of T1 (evict, or hit's promotion to T2): the floor up when the layer empties
 
   uint32_t L_ = 0, E_ = 0, nslots_ = 0;
   SlotLayout lay_;
   Memory mem_;
   Sync sync_;
-  bool complete_ = false, direct_ = false;
+  bool complete_ = false, direct_ = false, scan_victim_on_ = true;
   std::vector<int> fds_;
   std::vector<LayerSrc> src_;
 
@@ -266,6 +274,11 @@ class ExpertCache {
   std::vector<int32_t> free_;
   List t1_, t2_, b1_, b2_;
   double p_ = 0;
+  uint32_t scan_cursor_ = 0;  // a scan sweep's rotating slot for its victim (admit)
+  std::vector<uint32_t> layer_res_;  // resident slots per layer (admit / evict): scan_victim's "has the sweep passed it"
+  int low_layer_ = 0x7fffffff;       // the lowest layer with a resident slot: scan_victim returns -1 above it
+  std::vector<uint32_t> layer_t1_;   // T1 slots per layer: a sweep's victims, so a lower layer's hot T2 keys are no lap
+  int low_t1_ = 0x7fffffff;          // the lowest layer with a T1 slot: scan_victim returns -1 above it, a lap when below
   std::vector<int> active_;  // the keys of the last served request (in use on the GPU until the next ready)
 
   std::thread turn_;
