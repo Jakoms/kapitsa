@@ -2306,6 +2306,35 @@ Two runs of each engine, alternated (llama.cpp, Kapitsa, llama.cpp, Kapitsa, 22:
   [#324](https://github.com/nace-ai/kapitsa/pull/324) prices each requantized part.
 - **Not measured:** the 2-bit model against Flint's 4-bit export (it does not fit here), other Macs, 16K prompts.
 
+## Qwen3.8-Flash-Next streamed from the SSD: Kapitsa against llama.cpp (M5 Pro 48 GB, 2026-10-24)
+
+Flash-Next does not fit in 48 GB, so both engines stream routed experts from the internal disk. Measured on the
+MacBook Pro M5 Pro, 48 GB (`Mac17,8`, macOS 26.5.2, High Power mode, AC power): Kapitsa main `4b087c8` (`ni_run`, Q2_0
+pack, expert store **pinned at 24 GB**; the auto size here is about 29.9 GB, so a user's store is larger, but four runs at that size were stopped at memory pressure level 2 and are not in the table) against
+llama.cpp `0a9ef00` (`llama-server -ngl 99 -fa on`, ISTA's Q2_0 GGUF, mmap). Both used greedy decoding with no
+speculative decoding, and every model file was on the internal disk. Each length got two legs per engine in ABBA
+order; a cell is their mean. MLX was not measured. The legs, caveats, scripts and prompts are in
+[bench/results/2026-10-24-m5-pro-flash-next-ssd](../bench/results/2026-10-24-m5-pro-flash-next-ssd/README.md).
+
+| Prompt | Kapitsa prefill / decode (tok/s) | llama.cpp prefill / decode (tok/s) | Prefill | Decode |
+| --- | ---: | ---: | --- | --- |
+| 85 tokens | 52.7 / **40.5** | **255.0** / 39.0 | Kapitsa 79% slower | Kapitsa 4.0% faster |
+| 1K | 445.0 / **40.8** | **617.5** / 38.3 | Kapitsa 28% slower | Kapitsa 6.3% faster |
+| 4K | 558.2 / **40.0** | 569.4 / 37.1 | level (-2.0%, inside the spread) | Kapitsa 8.0% faster |
+| 16K | 555.0 / 34.7 | 549.7 / **36.5** | level (+1.0%) | Kapitsa 5.1% slower |
+| 32K | 549.9 / 32.7 | 535.4 / **35.6** | Kapitsa 2.7% faster (both legs above both of llama.cpp's) | Kapitsa 8.2% slower |
+
+**Kapitsa is not the fastest everywhere.** Its prefill is behind on short prompts, level at 4K and 16K, and slightly ahead at 32K, and its
+decode is ahead up to 4K and behind at 16K and 32K. Cold start to the first token on the 85-token prompt is level, not
+faster: Kapitsa's cold leg took 13.9 s against llama.cpp's 13.2 s. Its second leg (6.0 s) is not a cold start, because
+the pack was still in the page cache (weights loaded in 4.1 s against 12.0 s), so no percentage is given. Without
+`sudo purge`, the other engine's files were read through the page cache before each cold leg, so cold starts are
+approximate. Four runs at Kapitsa's auto store size (28-29.9 GB) were stopped at memory pressure level 2 (swap +1,847 MB
+in one of them) and are kept in `legs/aborted/`; whether a user's session would hit the same pressure was not tested. At 16K Kapitsa stopped at end-of-sequence after 47 tokens, while llama.cpp decoded
+128 (`ignore_eos`). The two engines run different quantized weights, so their greedy texts diverge after 2-63
+tokens and only speed is compared. llama.cpp with `--cpu-moe` ran 34.8 / 13.2 tok/s at 85 tokens and 132.9 / 14.6 at
+4K (a side row, not in the verdict).
+
 ## Your Mac: `kapitsa bench`
 
 `kapitsa bench` runs this protocol for Kapitsa alone, from the `kapitsa` binary: no Python, no configs, no weights to
