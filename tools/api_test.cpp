@@ -1174,6 +1174,33 @@ void history_gate_unit() {
   check(g.ready(11, 0, 901), "history gate: ready again when it has ended");
   QuietGate z(0, 5, 7);
   check(z.ready(5, 0, 7), "history gate: with no idle time it opens at once on an idle server");
+  // the slot a history prefill takes when its own was used meanwhile (--slots 1: the other conversation's)
+  check(pick_history_slot({{true, false, false, 5}}) == 0, "history slot: with one slot it takes that one, a continued conversation's");
+  check(pick_history_slot({{true, false, false, 5}, {true, false, false, 2}}) == -1,
+        "history slot: with several slots all holding continued conversations it gives up");
+  check(pick_history_slot({{true, false, false, 5}, {true, false, true, 9}, {true, true, false, 7}}) == 2,
+        "history slot: an empty slot is taken before a one-off");
+  check(pick_history_slot({{true, false, false, 5}, {true, false, true, 9}, {true, false, true, 3}}) == 2,
+        "history slot: of two one-offs the least recently used");
+  check(pick_history_slot({{false, true, false, 1}, {true, false, false, 2}}) == -1, "history slot: a busy slot is never taken");
+  {  // which older history prefill a newer request of the conversation supersedes
+    auto msgs = [](const char* sys, std::initializer_list<const char*> rest) {
+      ojson m = ojson::array();
+      m.push_back({{"role", "system"}, {"content", sys}});
+      int i = 0;
+      for (const char* c : rest) m.push_back({{"role", i++ % 2 ? "assistant" : "user"}, {"content", c}});
+      return history_message_hashes(m);
+    };
+    const auto a = msgs("date 1", {"q1"}), a2 = msgs("date 2", {"q1", "answer", "next"});
+    check(history_superseded(a, a2), "history stale: the next request of the conversation supersedes it, whatever the system prompt now says");
+    check(!history_superseded(a2, a), "history stale: an older request never supersedes a newer one");
+    check(!history_superseded(msgs("s", {"q1"}), msgs("s", {"other", "answer", "next"})), "history stale: another conversation does not");
+    check(!history_superseded({}, a2), "history stale: no messages supersede nothing");
+    // identical first messages (a replay loop): the same prefix, so the older work is obsolete, but a different later turn is not
+    check(!history_superseded(msgs("s", {"q1", "x", "y"}), msgs("s", {"q1", "z", "y"})), "history stale: same first message, different turns");
+  }
+  check(!history_should_yield(10, 10), "history yield: no request since the work began: it goes on");
+  check(history_should_yield(10, 11), "history yield: a request arrived: it stops at the chunk boundary");
 }
 
 // A float tool argument keeps its text through the Qwen3.5 / Nemotron templates' `| string` (without a model folder: a

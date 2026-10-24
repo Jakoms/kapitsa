@@ -1,5 +1,6 @@
 #pragma once
 #include "engine/engine.h"
+#include "engine/history_gate.h"
 #include "hub/hub.h"
 #include "server/cli.h"
 #include "server/ui.h"
@@ -279,11 +280,13 @@ class ModelManager : public std::enable_shared_from_this<ModelManager> {
     std::lock_guard<std::mutex> lk(prefill_mu_);
     // Several replies' history prefills can wait at once (two conversations on two slots finishing together):
     // each runs in its own thread, which waits for a quiet moment and takes the turn; the finished ones are
-    // joined here, so this call does not wait for a thread that is still waiting. At most one per slot: this
-    // reply's request used the slot after the older reply's (its gen moved), so the older prefill could only give
-    // up; it is told to stop, which bounds the threads (and the request copies they hold) by the slot count.
+    // joined here, so this call does not wait for a thread that is still waiting. A newer request of the same
+    // conversation (it sends the older request's messages back, after the system prompt, which may change) supersedes
+    // the older reply's history prefill, which is told to stop; a stream of one-off requests is bounded by kMaxPending.
+    // That bounds the threads (and the request copies they hold).
+    std::vector<size_t> hashes = history_message_hashes(r.messages);
     for (auto& p : prefill_ths_)
-      if (p.slot == out.slot) p.stale->store(true);
+      if (history_superseded(p.hashes, hashes)) p.stale->store(true);
     for (auto it = prefill_ths_.begin(); it != prefill_ths_.end();) {
       if (it->done->load()) {
         it->th.join();
@@ -306,7 +309,12 @@ class ModelManager : public std::enable_shared_from_this<ModelManager> {
         eng->prefill_history(r, out, [this, epoch, stale] { return epoch != model_epoch_.load() || stale->load(); });
       done->store(true);
     });
-    prefill_ths_.push_back({std::move(th), done, stale, out.slot});
+    prefill_ths_.push_back({std::move(th), done, stale, out.slot, std::move(hashes)});
+    // (the oldest beyond the cap are told to stop too)
+    size_t live = 0;
+    for (auto& p : prefill_ths_) live += !p.stale->load() && !p.done->load();
+    for (auto& p : prefill_ths_)
+      if (live > kMaxPending && !p.stale->load() && !p.done->load()) p.stale->store(true), --live;
   }
 
   std::string current_model_id() const {
@@ -518,9 +526,11 @@ class ModelManager : public std::enable_shared_from_this<ModelManager> {
   struct PrefillThread {
     std::thread th;
     std::shared_ptr<std::atomic<bool>> done;
-    std::shared_ptr<std::atomic<bool>> stale;  // a newer reply on the same slot: this one can only give up
+    std::shared_ptr<std::atomic<bool>> stale;  // a newer reply of the same conversation: this one can only give up
     int slot = -1;
+    std::vector<size_t> hashes;  // the request's messages after the system prompt (history_message_hashes)
   };
+  static constexpr size_t kMaxPending = 4;
   std::vector<PrefillThread> prefill_ths_;  // history prefills (under prefill_mu_)
   std::atomic<uint64_t> model_epoch_{0};
 };
