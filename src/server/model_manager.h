@@ -277,8 +277,20 @@ class ModelManager : public std::enable_shared_from_this<ModelManager> {
       if (engine_) engine_->remember_reply(r, out);
     }
     std::lock_guard<std::mutex> lk(prefill_mu_);
-    if (prefill_th_.joinable()) {
-      prefill_th_.join();
+    // Several replies' history prefills can wait at once (two conversations on two slots finishing together):
+    // each runs in its own thread, which waits for a quiet moment and takes the turn; the finished ones are
+    // joined here, so this call does not wait for a thread that is still waiting. At most one per slot: this
+    // reply's request used the slot after the older reply's (its gen moved), so the older prefill could only give
+    // up; it is told to stop, which bounds the threads (and the request copies they hold) by the slot count.
+    for (auto& p : prefill_ths_)
+      if (p.slot == out.slot) p.stale->store(true);
+    for (auto it = prefill_ths_.begin(); it != prefill_ths_.end();) {
+      if (it->done->load()) {
+        it->th.join();
+        it = prefill_ths_.erase(it);
+      } else {
+        ++it;
+      }
     }
     std::shared_ptr<Engine> eng;
     {
@@ -287,10 +299,14 @@ class ModelManager : public std::enable_shared_from_this<ModelManager> {
     }
     if (!eng) return;
     uint64_t epoch = model_epoch_.load();
-    prefill_th_ = std::thread([this, eng, r, out, epoch] {
-      if (epoch != model_epoch_.load()) return;
-      eng->prefill_history(r, out);
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    auto stale = std::make_shared<std::atomic<bool>>(false);
+    std::thread th([this, eng, r, out, epoch, done, stale] {
+      if (epoch == model_epoch_.load())
+        eng->prefill_history(r, out, [this, epoch, stale] { return epoch != model_epoch_.load() || stale->load(); });
+      done->store(true);
     });
+    prefill_ths_.push_back({std::move(th), done, stale, out.slot});
   }
 
   std::string current_model_id() const {
@@ -477,9 +493,9 @@ class ModelManager : public std::enable_shared_from_this<ModelManager> {
   void stop_prefill() {
     std::lock_guard<std::mutex> lk(prefill_mu_);
     model_epoch_++;
-    if (prefill_th_.joinable()) {
-      prefill_th_.join();
-    }
+    for (auto& p : prefill_ths_)
+      if (p.th.joinable()) p.th.join();
+    prefill_ths_.clear();
   }
 
   mutable std::shared_mutex rw_mu_;
@@ -499,7 +515,13 @@ class ModelManager : public std::enable_shared_from_this<ModelManager> {
   std::condition_variable_any in_flight_cv_;
 
   std::mutex prefill_mu_;
-  std::thread prefill_th_;
+  struct PrefillThread {
+    std::thread th;
+    std::shared_ptr<std::atomic<bool>> done;
+    std::shared_ptr<std::atomic<bool>> stale;  // a newer reply on the same slot: this one can only give up
+    int slot = -1;
+  };
+  std::vector<PrefillThread> prefill_ths_;  // history prefills (under prefill_mu_)
   std::atomic<uint64_t> model_epoch_{0};
 };
 
