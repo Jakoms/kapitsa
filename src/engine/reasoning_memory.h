@@ -15,6 +15,7 @@
 // part of the rendered text). A client that rewrites earlier messages (trims old tool results) gets no reasoning put
 // back: no match is the old behaviour. NI_REASONING_MEMORY=0 turns it off.
 #include "engine/grammar.h"
+#include "engine/tool_args.h"
 #include <cstdint>
 #include <cstdlib>
 #include <list>
@@ -40,7 +41,7 @@ class ReasoningMemory {
   // as JSON object text)
   void remember(const ojson& before, const std::string& content,
                 const std::vector<std::pair<std::string, std::string>>& calls, const std::string& reasoning) {
-    if (!enabled() || reasoning.empty() || !before.is_array()) return;
+    if (!enabled() || !before.is_array()) return;
     Entry e;
     e.reasoning = reasoning;
     Calls c;
@@ -48,7 +49,13 @@ class ReasoningMemory {
       c.emplace_back(name, parsed(ojson(args)));
       if (too_deep(c.back().second)) return;
       e.args.push_back(c.back().second);
+      ojson fn = {{"arguments", c.back().second}};  // each value's spelling (tool_args.h), as the model wrote it
+      tool_args::note_raw(fn, args);
+      e.raws.push_back(fn.contains("arguments_raw") ? fn["arguments_raw"] : ojson::object());
     }
+    bool spelled = false;  // some value's spelling to keep, so the turn is worth remembering without reasoning
+    for (auto& r : e.raws) spelled = spelled || !r.empty();
+    if (reasoning.empty() && !spelled) return;
     const std::string text = trimmed(ojson(content));
     if (text.empty() && c.empty()) return;
     Hash h;
@@ -58,6 +65,7 @@ class ReasoningMemory {
     if (e.key.empty()) return;
     e.bytes = e.key.size() + reasoning.size();
     for (auto& a : e.args) e.bytes += a.dump().size();
+    for (auto& a : e.raws) e.bytes += a.dump().size();
     std::lock_guard<std::mutex> lk(mu_);
     if (auto it = idx_.find(e.key); it != idx_.end()) {
       bytes_ -= it->second->bytes;
@@ -75,7 +83,7 @@ class ReasoningMemory {
   }
 
   // the messages' assistant turns that carry no reasoning, given the reasoning (and arguments) remembered for the same
-  // turn after the same conversation; how many
+  // turn after the same conversation; how many turns changed (reasoning put back, or the arguments' spellings the model wrote)
   int restore(ojson& messages) {
     if (!enabled() || !messages.is_array()) return 0;
     {
@@ -89,7 +97,7 @@ class ReasoningMemory {
       const bool assistant = m.contains("role") && m["role"] == "assistant";
       const bool has_reasoning = m.contains("reasoning_content") && m["reasoning_content"].is_string() &&
                                  !m["reasoning_content"].get<std::string>().empty();  // the client sent it
-      if (assistant && !has_reasoning && !h.skip) {
+      if (assistant && !h.skip) {
         Calls calls;
         bool deep = false;
         if (m.contains("tool_calls") && m["tool_calls"].is_array())
@@ -104,27 +112,39 @@ class ReasoningMemory {
         if (!deep && !(text.empty() && calls.empty())) {
           const std::string key = h.turn(text, calls);
           std::string reasoning;
-          std::vector<ojson> args;
+          std::vector<ojson> args, raws;
+          bool hit = false;
           {
             std::lock_guard<std::mutex> lk(mu_);
             if (auto it = idx_.find(key); it != idx_.end()) {
               lru_.splice(lru_.begin(), lru_, it->second);
+              hit = true;
               reasoning = lru_.front().reasoning;
               args = lru_.front().args;
+              raws = lru_.front().raws;
             }
           }
-          if (!reasoning.empty()) {
-            m["reasoning_content"] = reasoning;
-            if (m.contains("tool_calls") && m["tool_calls"].is_array() && m["tool_calls"].size() == args.size())
-              for (size_t i = 0; i < args.size(); ++i) {
-                if (!m["tool_calls"][i].is_object() || !m["tool_calls"][i].contains("function") ||
-                    !m["tool_calls"][i]["function"].is_object())
-                  continue;
-                ojson& a = m["tool_calls"][i]["function"]["arguments"];
+          const bool found = hit;
+          const ojson was = found ? m : ojson();
+          if (found && m.contains("tool_calls") && m["tool_calls"].is_array() && m["tool_calls"].size() == args.size())
+            for (size_t i = 0; i < args.size(); ++i) {
+              if (!m["tool_calls"][i].is_object() || !m["tool_calls"][i].contains("function") ||
+                  !m["tool_calls"][i]["function"].is_object())
+                continue;
+              ojson& fn = m["tool_calls"][i]["function"];
+              // the spelling of each value as the model wrote it wins over the client's: a client that parsed and re-dumped
+              // the arguments (compact `[1,2]` for the model's `[1, 2]`) or sent a parsed object has another one
+              if (i < raws.size() && !raws[i].empty()) fn["arguments_raw"] = raws[i];
+              else fn.erase("arguments_raw");
+              if (!has_reasoning && !reasoning.empty()) {
+                ojson& a = fn["arguments"];
                 a = a.is_string() ? ojson(args[i].dump()) : args[i];
               }
-            ++restored;
+            }
+          if (found && !has_reasoning && !reasoning.empty()) {
+            m["reasoning_content"] = reasoning;
           }
+          if (found && m != was) ++restored;
         }
       }
       h.message(m);
@@ -230,6 +250,7 @@ class ReasoningMemory {
   struct Entry {
     std::string key, reasoning;
     std::vector<ojson> args;  // each call's arguments as the model wrote them
+    std::vector<ojson> raws;  // each call's value spellings (tool_args::note_raw)
     size_t bytes = 0;
   };
 
