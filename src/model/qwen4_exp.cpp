@@ -19,6 +19,7 @@
 #include <unordered_map>
 
 namespace ni {
+extern const char* const kTensorKernelSource;
 
 using json = nlohmann::json;
 
@@ -27,7 +28,13 @@ namespace {
 Pipeline pipe(const std::string& n) {
   static std::unordered_map<std::string, Pipeline> cache;
   auto it = cache.find(n);
-  if (it == cache.end()) it = cache.emplace(n, Gpu::get().pipeline(n)).first;
+  if (it == cache.end()) {
+    // The same trigger qwen35.cpp's pipe() carries: the tensor-library kernels (NI_HC_FUSE's qmt6_mix_m64_n64)
+    // live in kTensorKernelSource and Gpu::pipeline() is required-by-default, so without this the first fused
+    // dispatch would fatal("kernel ... not found") in a process that has not compiled the library yet.
+    if (n.rfind("qmt", 0) == 0 || n.rfind("qattn_t", 0) == 0) Gpu::get().compile_extra("tensor", kTensorKernelSource, true);
+    it = cache.emplace(n, Gpu::get().pipeline(n)).first;
+  }
   return it->second;
 }
 
@@ -962,6 +969,29 @@ void Qwen4Exp::enc_gr_prefill(Encoder& e, const GatedRes& g, int T, const Buffer
   e.use(pipe("hc_act_h"));
   e.buf(0, hch_); e.buf(1, hchh_); e.val(2, n); e.val(3, inv_s);
   e.dispatch((n + 255) / 256, 1, 1, 256);
+  // NI_HC_FUSE (default off): the mix folded into the up projection's tensor-ops tile — qmt6_mix_m64_n64 runs
+  // qmt6_m64_n64's k-loop once per stream and drains sigmoid(m) * Xn into a second destination tensor in
+  // hc_mix_impl's order, so the [T, S*D] fp32 mix buffer (hcm_) is never written or read back (16K prefill on
+  // Flash-Next q20: 84 MB written + 84 MB read and one dispatch per hyper-connection per chunk saved).
+  // Intended to be bitwise identical to the two dispatches it replaces; no GPU run of the kernel exists yet.
+  // Engages only where the up GEMM it replaces is exactly enc_qmm_large's qmt6_m64_n64 branch: qmm_on() (its
+  // q.on), qmt6_on(), T >= 64, and not the short-prefill enc_proj detour (!small_t(T), which enc_qmm takes when
+  // shortpf() && T <= shortpf_max()). Against any other baseline (qrf, qmr, enc_proj) the fused tile would be a
+  // reassociation rather than the bitwise claim, so the fold stays off there.
+  static const bool fuse = env_on("NI_HC_FUSE");
+  const uint32_t rank = uint32_t(c4_.hc_rank);
+  if (fuse && qmm_on() && qmt6_on() && T >= 64 && !small_t(T) && g.down.same_format(g.up) && g.up.bits == 6 &&
+      g.up.gs == 64 && rank % 64 == 0 && D % 64 == 0) {
+    const struct {
+      uint32_t M, N, K, x_ld, D, S, u_ld;
+    } mp{uint32_t(T), S * D, rank, rank, D, S, D};
+    e.use(pipe("qmt6_mix_m64_n64"));
+    e.buf(0, hchh_); e.buf(1, g.up.w->buf); e.buf(2, g.up.s->buf); e.buf(3, g.up.b->buf);
+    e.buf(4, xn4h_); e.buf(5, xh_);
+    e.val(6, mp);
+    e.dispatch(D / 64, (uint32_t(T) + 63) / 64, 1, 128);
+    return;
+  }
   enc_qmm(e, g.up, hchh_, hcm_, T, false);
   const uint32_t ld = D;
   e.use(pipe("hc_mix_h"));
