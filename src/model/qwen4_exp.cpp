@@ -1195,6 +1195,34 @@ void Qwen4Exp::enc_attn_sparse(Encoder& e, const Buffer& kc, const Buffer& vc, i
   const size_t qoff = size_t(q_row0) * cfg_.hq * cfg_.head_dim * 4;
   if (!partials) {
     const AttnSparseParams p{uint32_t(cfg_.hq), uint32_t(cfg_.hkv), maxn, uint32_t(cap), scale, 1, qidx_ld_};
+    // NI_QSA_TATTN=1: the lists on the matrix units (tensor/qsattn_t.metal, qattn_t_sparse_g12d2) where the kernel
+    // fits: 12 query heads per KV head, head dim 256, Apple10 and macOS 26 (the Metal 4 library). Else attn_sparse_rows.
+    static const bool tat_env = [] {
+      const char* v = getenv("NI_QSA_TATTN");
+      return v && *v && atoi(v) != 0;
+    }();
+    bool tat = false;
+    if (tat_env) {
+      bool os = false;
+      if (__builtin_available(macOS 26.0, *)) os = true;
+      tat = os && G == 12 && cfg_.head_dim == 256 && Gpu::get().apple_family() >= 10;
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        fprintf(stderr, "[kapitsa] NI_QSA_TATTN: %s\n",
+                tat ? "sparse list attention on the matrix units (qattn_t_sparse_g12d2)"
+                    : "needs 12 query heads per KV head, head dim 256, an M5 and macOS 26; keeping attn_sparse_rows");
+      }
+    }
+    if (tat) {
+      const uint32_t rr = uint32_t(R);
+      e.use(pipe("qattn_t_sparse_g12d2"));
+      e.buf(0, qo_, qoff); e.buf(1, kc); e.buf(2, vc); e.buf(3, qg_, qoff * 2); e.buf(4, attn_out_, qoff);
+      e.val(5, p);
+      e.buf(6, qidx_); e.buf(7, qcnt_); e.val(8, rr);
+      e.dispatch(rr, uint32_t(cfg_.hkv), 1, 64);  // a pair of simdgroups per row and KV head
+      return;
+    }
     e.use(pipe("attn_sparse_rows"));
     e.buf(0, qo_, qoff); e.buf(1, kc); e.buf(2, vc); e.buf(3, qg_, qoff * 2); e.buf(4, attn_out_, qoff);
     e.val(5, p);
