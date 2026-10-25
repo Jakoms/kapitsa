@@ -363,14 +363,48 @@ bool DFlash2::rows16_tensor_ok() const {
   return tw;
 }
 
+// The KFlash tree default is the trees on every target, as it has been since #187. NI_DFLASH_CAP=<n> (the F74
+// verify-cost decomposition's verify-depth cap) opts into the capped-chain path instead: trees need
+// verify_depth() == block() - 1, so a genuinely capped depth cannot run them, and every env read must see the
+// same answer, else the 16-row auto block is picked for a lattice no capped verify can tree. Only a genuine cap
+// counts: a CAP at or above the full depth (block() - 1) is a no-op -- the trees stay on and nothing is capped
+// -- so an arm that names a full-depth cap measures what it believes it measures. The measured basis for the
+// cap (ledger §2.16 as corrected through §2.32-E, docs/kflash.md): two clean same-policy mode-3 chain anchors
+// at depths 2/3, ids-identical on the F74 legs, read
+// cheaper per token than any deeper measured arm; the ship comparison (shipping tree-7 vs capped chain-2)
+// buys 1.46x per token and 2.01x per cycle in the shipping build, measured on one pinned binary (ledger
+// rulings v2.39-197; quiet-window-confirmed, §8w canonical 1.44-1.46x/token within-window pinned,
+// arm-qualified; the earlier 1.56x carrier figure is historical only -- it crosses eras at both ends),
+// and the shipping default stays untouched until the
+// shipping-binary sweep (4K AND 32K, ids match, ABBA >= 8) settles it. A genuine cap below the full depth
+// keeps the chains and the 8-row plan even where the trees are explicitly asked -- a capped verify cannot tree
+// the lattice (set_tree keeps the trees only at the full depth), and rows16_auto_ok / plan_block_rows read the
+// same answer; an explicit NI_DFLASH_VERIFY overrides the cap here as it overrides the depth below, and with the
+// cap unset or a no-op, NI_KFLASH / NI_DFLASH_TREE decide as before. (The Nemotron-H
+// side, in Engine, keeps its own default.)
+static bool kf_tree_default(int full) {
+  // NI_DFLASH_VERIFY set: the cap does not decide the trees. The depth the verify asked for is the depth that
+  // runs (the constructor below), and a cap dropping the trees under it would silently chain an asked-for tree
+  // -- CAP=2 + VERIFY=7 wants the full-depth walk at 7 on an 8-row block, exactly the plan VERIFY=7 alone
+  // gives (Cursor review 4368392777). VERIFY below the full depth chains anyway: set_tree's full-depth guard.
+  const char* vv = getenv("NI_DFLASH_VERIFY");
+  const char* cv = getenv("NI_DFLASH_CAP");
+  const int c = cv && *cv ? atoi(cv) : 0;
+  if (!(vv && *vv) && c >= 1 && c < full)
+    return false;  // a genuine cap: a capped verify cannot tree the lattice, knobs or not
+  const char* tv = getenv("NI_DFLASH_TREE");
+  if (tv && *tv) return atoi(tv) != 0;
+  const char* kf = getenv("NI_KFLASH");
+  if (kf && *kf) return atoi(kf) != 0;
+  return true;  // a cap at or above the full depth (or a bad value) is a no-op: trees, as unset
+}
+
 bool DFlash2::rows16_auto_ok() const {
   // the same conditions the load-time gate below refuses NI_DFLASH_BLOCK=16 under, read from the environment here
   // because set_tree() runs after the block must be known: trees on, and a walk deep enough to use all 16 rows (a
   // 15-row lattice is what the block drafts; set_tree keeps the tree only where verify_depth() == block() - 1)
   if (!tg_.block_drafter_ok() || !tg_.verify_tree_ok() || !tg_.verify_wide_ok()) return false;
-  const char* kf = getenv("NI_KFLASH");
-  const char* tv = getenv("NI_DFLASH_TREE");
-  if (!(tv && *tv ? atoi(tv) != 0 : (!(kf && *kf) || atoi(kf) != 0))) return false;
+  if (!kf_tree_default(15)) return false;  // the 16-row block's full depth
   const char* vv = getenv("NI_DFLASH_VERIFY");
   if (vv && *vv && atoi(vv) < 15) return false;
   return rows16_tensor_ok();
@@ -475,7 +509,31 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits, bool rows16) 
            "runs 16 rows; NI_DFLASH_BLOCK=8 keeps 8)");
     }
     const char* vv = getenv("NI_DFLASH_VERIFY");
-    vdepth_ = std::clamp(vv && *vv ? atoi(vv) : block_ - 1, 1, block_ - 1);
+    // The verify-depth default is the full block depth, as before; NI_DFLASH_CAP=<n> (the F74 depth cap) opts into
+    // a capped chain path, and NI_DFLASH_VERIFY=<n> overrides both. Only a genuine cap engages: a CAP at or above
+    // the full depth of the block that runs leaves that block at full depth with the trees (kf_tree_default above
+    // reads the same answer) -- but the 16-row choice reads kf_tree_default(15), so any cap below 15 keeps the
+    // 8-row block, trees at depth 7, and 7..14 is not the same machine state as the cap unset; only at or above
+    // 15 is it a no-op outright -- and below the full depth the CAP is
+    // the same axis as the existing NI_DFLASH_VERIFY -- a capped depth is always a chain, because set_tree keeps
+    // the trees only at the full depth. The shipping default changes only where the pre-registered shipping-binary
+    // sweep (4K AND 32K, ids match, ABBA >= 8) says so (docs/kflash.md, ledger rulings v2). The batched cycle
+    // (Engine::batch_cycle under the KfBatch budget) keeps its own rows -- a batch amortizes the per-row weight
+    // read that a deeper verify pays.
+    const char* cv = getenv("NI_DFLASH_CAP");
+    const int c = cv && *cv ? atoi(cv) : 0;
+    const bool capped = !(vv && *vv) && c >= 1 && c < block_ - 1;
+    vdepth_ = std::clamp(vv && *vv ? atoi(vv) : capped ? c : block_ - 1, 1, block_ - 1);
+    if (cv && *cv && !(vv && *vv)) {
+      if (capped)
+        logi("DFlash2: NI_DFLASH_CAP -- verify depth %d, chain drafts (the F74 depth cap, opt-in; measured basis "
+             "and the pending sweep in docs/kflash.md; NI_DFLASH_VERIFY=n overrides)",
+             vdepth_);
+      else
+        logi("DFlash2: NI_DFLASH_CAP=%s is not below the full depth %d of this block: ignored -- full depth with "
+             "the trees (any cap below 15 keeps the 8-row block, trees at depth 7; only at or above 15 is the cap "
+             "a no-op, the 16-row choice untouched)", cv, block_ - 1);
+    }
   }
   alloc_buffers();
   {  // reduced draft head (default on): NI_DFLASH_HEAD=n rows (0 = the full vocabulary)
@@ -552,11 +610,10 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits, bool rows16) 
     // the knobs (NI_KFLASH, NI_DFLASH_TREE, NI_KFLASH_ROWS) allow them (Qwen35::kf_dense_rows, which plan() reads too,
     // and which rejects a bad NI_KFLASH_ROWS)
     uint32_t allowed = moe ? (1u << kB) - 1 : Qwen35::kf_dense_rows(tg_.config());
-    // One rule on every target (here and on Nemotron-H): trees. NI_KFLASH=0 keeps the chains everywhere;
-    // NI_DFLASH_TREE=0/1 overrides it here.
-    const char* kf = getenv("NI_KFLASH");
-    const char* v = getenv("NI_DFLASH_TREE");
-    set_tree(v && *v ? atoi(v) != 0 : (!(kf && *kf) || atoi(kf) != 0));
+    // One rule on every target (here and on Nemotron-H): trees, unless a knob keeps the chains -- NI_KFLASH=0,
+    // NI_DFLASH_TREE=0, or a genuine F74 depth cap NI_DFLASH_CAP=<n> below the full depth (kf_tree_default()
+    // above), which cannot run them.
+    set_tree(kf_tree_default(block_ - 1));
     // The downward depth gate caps a chain's dynamic depth: encode_cycle_verify returns from its tree branch
     // before the gate code, so an asked-for gate under the (default) trees would log as engaged and then never
     // observe, cap or trace. Say so here, at load, where tree_ is final (set_tree has no later callers).
@@ -576,7 +633,10 @@ DFlash2::DFlash2(Qwen35& target, const std::string& dir, int bits, bool rows16) 
     // a drafting block of 16 rows drafts a depth-15 lattice: its verify must run 16+ rows, so the narrow tile goes
     // and the block's own width comes in whatever NI_KFLASH_ROWS asked for
     if (block() > kB) {
-      if (!tree_) fatal("NI_DFLASH_BLOCK=%d needs KFlash trees (NI_KFLASH=1)", block());
+      if (!tree_)
+        fatal("NI_DFLASH_BLOCK=%d needs KFlash trees (NI_KFLASH=1 or NI_DFLASH_TREE=1; a genuine NI_DFLASH_CAP "
+              "below the full depth decides over them -- unset it, or set NI_DFLASH_VERIFY to the full depth)",
+              block());
       if (!tg_.verify_wide_ok()) fatal("NI_DFLASH_BLOCK=%d: this target has no wide tree verify", block());
       // and the drafting pass itself must run on the matrix units: a 16-row block drafts its two tiles with the pair
       // kernel and the tensor-path GEMMs, and has no 8-row fallback (encode_draft_impl and enc_qmm8 fatal otherwise).
@@ -832,9 +892,7 @@ int DFlash2::plan_block_rows(const Qwen35Config& target, int slots, const char* 
   // on such a drafter this is an upper bound: the plan reserves 16 rows and the load keeps 8, ~30 MB on the 27B. A MoE
   // target has no wide verify, and a multi-slot engine co-decodes requests, so both keep the 8-row tile.
   if (slots != 1 || target.moe) return kB;
-  const char* kf = getenv("NI_KFLASH");
-  const char* tv = getenv("NI_DFLASH_TREE");
-  if (!(tv && *tv ? atoi(tv) != 0 : (!(kf && *kf) || atoi(kf) != 0))) return kB;
+  if (!kf_tree_default(15)) return kB;  // the 16-row block's full depth
   const char* vv = getenv("NI_DFLASH_VERIFY");
   if (vv && *vv && atoi(vv) < 15) return kB;
   const char* av = getenv("NI_DFLASH_ATTN");
